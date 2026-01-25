@@ -432,6 +432,35 @@ typedef struct {
 } block_q8_K;
 static_assert(sizeof(block_q8_K) == sizeof(float) + QK_K + QK_K/16*sizeof(int16_t), "wrong q8_K block size/padding");
 
+// MXFP4 (Microscaling FP4) quantization
+// 32 elements in 17 bytes: 1 byte E8M0 exponent + 16 bytes (32 x 4-bit values)
+#define QK_MXFP4 32
+#define QR_MXFP4 2
+#define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
+typedef struct {
+    uint8_t e;              // E8M0 exponent
+    uint8_t qs[QK_MXFP4/2]; // 32 4-bit values packed into 16 bytes
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == 17, "wrong mxfp4 block size/padding");
+
+// MXFP4 lookup table - E2M1 doubled values
+__constant__ int8_t kvalues_mxfp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12,        // positive
+    0, -1, -2, -3, -4, -6, -8, -12  // negative
+};
+
+// Convert E8M0 exponent to scale factor
+// E8M0 format: scale = 2^(e-127) for e != 0, special handling for e == 0
+static __device__ __forceinline__ float e8m0_to_scale(uint8_t e) {
+    if (e == 0) {
+        // Subnormal: 2^(-127)
+        return __int_as_float(0x00800000 >> 1);
+    } else {
+        // Normal: 2^(e-127)
+        return __int_as_float(((uint32_t)(e) - 1) << 23);
+    }
+}
+
 
 template <int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x, int mmq_y, int nwarps,
               allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
@@ -752,6 +781,20 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.x *= d;
     v.y *= d;
 #endif // GGML_CUDA_F16
+}
+
+static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int ib, const int iqs, dfloat2 & v){
+    const block_mxfp4 * x = (const block_mxfp4 *) vx;
+
+    const float scale = e8m0_to_scale(x[ib].e);
+
+    const int vui = x[ib].qs[iqs];
+
+    const int idx0 = vui & 0xF;
+    const int idx1 = vui >> 4;
+
+    v.x = kvalues_mxfp4[idx0] * scale;
+    v.y = kvalues_mxfp4[idx1] * scale;
 }
 
 
@@ -1091,6 +1134,34 @@ static __device__ void dequantize_block_q8_0(const void * __restrict__ vx, dst_t
 }
 
 template<typename dst_t>
+static __device__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
+    const int64_t i = blockIdx.x;
+
+    // assume 32 threads
+    const int tid = threadIdx.x;
+    const int il  = tid/8;
+    const int ir  = tid%8;
+    const int64_t ib = 8*i + ir;
+    if (ib >= nb32) {
+        return;
+    }
+
+    dst_t * y = yy + 256*i + 32*ir + 4*il;
+
+    const block_mxfp4 * x = (const block_mxfp4 *)vx + ib;
+    const float scale = e8m0_to_scale(x->e);
+
+    const uint8_t * q = x->qs + 4*il;
+
+    for (int l = 0; l < 4; ++l) {
+        const int idx0 = q[l] & 0xF;
+        const int idx1 = q[l] >> 4;
+        y[l+ 0] = scale * kvalues_mxfp4[idx0];
+        y[l+16] = scale * kvalues_mxfp4[idx1];
+    }
+}
+
+template<typename dst_t>
 static __device__ void dequantize_block_q8_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const block_q8_K * x = (const block_q8_K *) vx;
 
@@ -1155,6 +1226,7 @@ DEQUANTIZE(q4_1)
 DEQUANTIZE(q5_0)
 DEQUANTIZE(q5_1)
 DEQUANTIZE(q8_0)
+DEQUANTIZE(mxfp4)
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static __device__ void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows) {
@@ -1241,6 +1313,10 @@ extern "C" __global__ void dequantize_mul_mat_vec_q5_1_cuda(const void * vx, con
 }
 extern "C" __global__ void dequantize_mul_mat_vec_q8_0_cuda(const void * vx, const dfloat * y, float * dst, const int ncols, const int nrows) {
     dequantize_mul_mat_vec<QK8_0, QR8_0, dequantize_q8_0>(vx, y, dst, ncols, nrows);
+}
+
+extern "C" __global__ void dequantize_mul_mat_vec_mxfp4_cuda(const void * vx, const dfloat * y, float * dst, const int ncols, const int nrows) {
+    dequantize_mul_mat_vec<QK_MXFP4, QR_MXFP4, dequantize_mxfp4>(vx, y, dst, ncols, nrows);
 }
 
 extern "C" __global__ void dequantize_mul_mat_vec_q2_k(const void * __restrict__ vx, const float * __restrict__ yy, float * __restrict__ dst, const int ncols, int nrows) {

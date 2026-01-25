@@ -19,6 +19,13 @@ pub const QK5_0: usize = 32;
 pub const QK5_1: usize = 32;
 pub const QK8_0: usize = 32;
 pub const QK8_1: usize = 32;
+pub const QK_MXFP4: usize = 32;
+
+/// MXFP4 lookup table - E2M1 doubled values
+pub const KVALUES_MXFP4: [i8; 16] = [
+    0, 1, 2, 3, 4, 6, 8, 12,        // positive
+    0, -1, -2, -3, -4, -6, -8, -12, // negative
+];
 
 pub trait GgmlType: Sized + Clone + Send + Sync {
     const DTYPE: GgmlDType;
@@ -168,6 +175,48 @@ pub struct BlockQ8K {
     pub(crate) bsums: [i16; QK_K / 16],
 }
 const _: () = assert!(4 + QK_K + QK_K / 16 * 2 == std::mem::size_of::<BlockQ8K>());
+
+/// MXFP4 block: 32 elements in 17 bytes
+/// Structure: 1 byte E8M0 exponent + 16 bytes (32 x 4-bit values)
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockMxfp4 {
+    pub(crate) e: u8,                  // E8M0 exponent
+    pub(crate) qs: [u8; QK_MXFP4 / 2], // 32 4-bit values packed into 16 bytes
+}
+const _: () = assert!(std::mem::size_of::<BlockMxfp4>() == 17);
+
+/// Convert E8M0 exponent to scale factor
+/// E8M0 format: scale = 2^(e-127) for e != 0, special handling for e == 0
+#[inline]
+pub fn e8m0_to_scale(e: u8) -> f32 {
+    if e == 0 {
+        // Subnormal: 2^(-127)
+        f32::from_bits(0x00800000 >> 1)
+    } else {
+        // Normal: 2^(e-127)
+        f32::from_bits(((e as u32).wrapping_sub(1)) << 23)
+    }
+}
+
+/// Find the best MXFP4 index for a given value and scale
+#[inline]
+fn best_mxfp4_index(value: f32, scale: f32) -> usize {
+    if scale == 0.0 {
+        return 0;
+    }
+    let target = value / scale;
+    let mut best_idx = 0usize;
+    let mut best_err = f32::MAX;
+    for (i, &k) in KVALUES_MXFP4.iter().enumerate() {
+        let err = (k as f32 - target).abs();
+        if err < best_err {
+            best_err = err;
+            best_idx = i;
+        }
+    }
+    best_idx
+}
 
 impl GgmlType for BlockQ4_0 {
     const DTYPE: GgmlDType = GgmlDType::Q4_0;
@@ -2484,6 +2533,113 @@ impl GgmlType for bf16 {
     }
 }
 
+impl GgmlType for BlockMxfp4 {
+    const DTYPE: GgmlDType = GgmlDType::Mxfp4;
+    const BLCK_SIZE: usize = QK_MXFP4;
+    type VecDotType = BlockQ8_0;
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let k = ys.len();
+        debug_assert!(
+            k.is_multiple_of(QK_MXFP4),
+            "dequantize_row_mxfp4: {k} is not divisible by {QK_MXFP4}"
+        );
+
+        let nb = k / QK_MXFP4;
+        for i in 0..nb {
+            let scale = e8m0_to_scale(xs[i].e);
+
+            for j in 0..(QK_MXFP4 / 2) {
+                let idx0 = (xs[i].qs[j] & 0x0F) as usize;
+                let idx1 = (xs[i].qs[j] >> 4) as usize;
+
+                ys[i * QK_MXFP4 + j * 2] = KVALUES_MXFP4[idx0] as f32 * scale;
+                ys[i * QK_MXFP4 + j * 2 + 1] = KVALUES_MXFP4[idx1] as f32 * scale;
+            }
+        }
+    }
+
+    fn from_float(xs: &[f32], ys: &mut [Self]) {
+        let qk = Self::BLCK_SIZE;
+        let k = xs.len();
+        debug_assert!(k.is_multiple_of(qk), "{k} is not divisible by {qk}");
+        debug_assert_eq!(
+            ys.len(),
+            k / qk,
+            "size mismatch {} {} {}",
+            xs.len(),
+            ys.len(),
+            qk,
+        );
+
+        for (i, ys) in ys.iter_mut().enumerate() {
+            let xs = &xs[i * qk..(i + 1) * qk];
+
+            // Find the maximum absolute value in this block
+            let mut amax = 0f32;
+            for &x in xs.iter() {
+                amax = amax.max(x.abs());
+            }
+
+            // Determine the E8M0 exponent
+            // The maximum representable value in E2M1 is 12 (KVALUES_MXFP4[7] or [15])
+            // So we need scale such that amax / scale <= 12
+            // scale = 2^(e-127), so e = floor(log2(amax/12)) + 127
+            let e = if amax == 0.0 {
+                0u8
+            } else {
+                let log2_scale = (amax / 12.0).log2();
+                let e_float = log2_scale + 127.0;
+                e_float.ceil().clamp(0.0, 255.0) as u8
+            };
+            ys.e = e;
+            let scale = e8m0_to_scale(e);
+
+            // Quantize each value
+            for (j, q) in ys.qs.iter_mut().enumerate() {
+                let idx0 = best_mxfp4_index(xs[j * 2], scale);
+                let idx1 = best_mxfp4_index(xs[j * 2 + 1], scale);
+                *q = (idx0 as u8) | ((idx1 as u8) << 4);
+            }
+        }
+    }
+
+    fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        Self::vec_dot_unopt(n, xs, ys)
+    }
+
+    fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        debug_assert!(
+            n.is_multiple_of(QK_MXFP4),
+            "vec_dot_mxfp4_q8_0: {n} is not divisible by {QK_MXFP4}"
+        );
+
+        let nb = n / QK_MXFP4;
+        let mut sumf = 0f32;
+
+        for i in 0..nb {
+            let scale = e8m0_to_scale(xs[i].e);
+            let yd = f16::to_f32(ys[i].d);
+            let mut sum_i = 0i32;
+
+            for j in 0..(QK_MXFP4 / 2) {
+                let idx0 = (xs[i].qs[j] & 0x0F) as usize;
+                let idx1 = (xs[i].qs[j] >> 4) as usize;
+
+                let x0 = KVALUES_MXFP4[idx0] as i32;
+                let x1 = KVALUES_MXFP4[idx1] as i32;
+
+                sum_i += x0 * ys[i].qs[j * 2] as i32;
+                sum_i += x1 * ys[i].qs[j * 2 + 1] as i32;
+            }
+
+            sumf += sum_i as f32 * scale * yd;
+        }
+
+        sumf
+    }
+}
+
 macro_rules! verify_block_size {
     ( $block_type:ident ) => {
         const _: () =
@@ -2501,5 +2657,5 @@ macro_rules! verify_block_sizes {
 
 verify_block_sizes!(
     BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1, BlockQ2K, BlockQ3K, BlockQ4K,
-    BlockQ5K, BlockQ6K, BlockQ8K, f32, f16, bf16
+    BlockQ5K, BlockQ6K, BlockQ8K, BlockMxfp4, f32, f16, bf16
 );
